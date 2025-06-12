@@ -1,114 +1,158 @@
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
-from ultralytics import YOLO
-from transformers import BlipProcessor, BlipForConditionalGeneration, DetrImageProcessor, DetrForObjectDetection
 import torch
+from PIL import Image, ImageDraw, ImageFont
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from ultralytics import YOLO
+import os
+import numpy as np
+import tempfile
 
-# Load all models from local
+st.set_page_config(page_title="Image Analysis: YOLO vs BLIP", layout="wide")
+
 @st.cache_resource
 def load_models():
-    yolo = YOLO("models/yolov8n.pt")
-
-    # Load DETR
-    detr_model = DetrForObjectDetection.from_pretrained("models/detr")
-    detr_processor = DetrImageProcessor.from_pretrained("models/detr")
-
-    # BLIP base
-    blip_base_model = BlipForConditionalGeneration.from_pretrained("models/blip-base")
-    blip_base_processor = BlipProcessor.from_pretrained("models/blip-base")
-
-    # BLIP large
-    blip_large_model = BlipForConditionalGeneration.from_pretrained("models/blip-large")
-    blip_large_processor = BlipProcessor.from_pretrained("models/blip-large")
-
-    return yolo, (detr_processor, detr_model), (blip_base_processor, blip_base_model), (blip_large_processor, blip_large_model)
-
-yolo_model, (detr_processor, detr_model), (blip_base_proc, blip_base_model), (blip_large_proc, blip_large_model) = load_models()
-
-# Draw boxes from DETR
-def draw_boxes_detr(image: Image.Image, outputs, threshold=0.5):
-    draw = ImageDraw.Draw(image)
+    """Load YOLO and BLIP models"""
+    models = {}
+    
+    # Use temporary directory for model storage in cloud
+    temp_dir = tempfile.gettempdir()
+    
+    # BLIP Base Model
+    blip_dir = os.path.join(temp_dir, "blip-image-captioning-base")
     try:
-        font = ImageFont.truetype("arial.ttf", size=12)
+        if os.path.exists(blip_dir) and os.listdir(blip_dir):
+            blip_processor = BlipProcessor.from_pretrained(blip_dir, local_files_only=True)
+            blip_model = BlipForConditionalGeneration.from_pretrained(blip_dir, local_files_only=True)
+        else:
+            st.info("Loading BLIP model...")
+            blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+            blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+            os.makedirs(blip_dir, exist_ok=True)
+            blip_processor.save_pretrained(blip_dir)
+            blip_model.save_pretrained(blip_dir)
+        
+        models['blip'] = (blip_processor, blip_model)
+    except Exception as e:
+        st.error(f"Error loading BLIP model: {e}")
+        return None
+    
+    # YOLOv11 Model
+    try:
+        st.info("Loading YOLOv11 model...")
+        yolo_model = YOLO('yolo11n.pt')  # Will download if not exists
+        models['yolo'] = yolo_model
+    except Exception as e:
+        st.error(f"Error loading YOLO model: {e}")
+        return None
+    
+    return models
+
+def generate_blip_caption(image, processor, model):
+    """Generate BLIP caption"""
+    inputs = processor(image, return_tensors="pt")
+    with torch.no_grad():
+        output = model.generate(**inputs, max_length=50, num_beams=4)
+    return processor.decode(output[0], skip_special_tokens=True)
+
+def detect_yolo_objects(image, model, conf_threshold=0.5):
+    """YOLOv11 object detection"""
+    results = model(image, conf=conf_threshold)
+    detected_objects = []
+    
+    for result in results:
+        boxes = result.boxes
+        if boxes is not None:
+            for box in boxes:
+                detected_objects.append({
+                    'label': result.names[int(box.cls)],
+                    'confidence': round(float(box.conf), 3),
+                    'box': box.xyxy[0].tolist()
+                })
+    
+    return detected_objects
+
+def draw_boxes(image, objects, color='red'):
+    """Draw bounding boxes on image"""
+    img_copy = image.copy()
+    draw = ImageDraw.Draw(img_copy)
+    
+    try:
+        font = ImageFont.truetype("arial.ttf", 16)
     except:
         font = ImageFont.load_default()
-
-    for box, label, score in zip(outputs['boxes'], outputs['labels'], outputs['scores']):
-        if score > threshold:
-            box = [round(i, 2) for i in box.tolist()]
-            draw.rectangle(box, outline="red", width=2)
-            draw.text((box[0], box[1]-10), f"{label} ({score:.2f})", fill="red", font=font)
-
-    return image
-
-# Generate caption
-def generate_caption(processor, model, image):
-    inputs = processor(images=image, return_tensors="pt").to(model.device)
-    out = model.generate(**inputs)
-    return processor.decode(out[0], skip_special_tokens=True)
-
-# UI Layout
-st.set_page_config(page_title="Visual AI Comparison", layout="wide")
-st.title("🤖 Visual AI Comparison: YOLOv8 vs DETR vs BLIP")
-
-uploaded_file = st.file_uploader("📤 Upload an Image", type=["jpg", "jpeg", "png"])
-
-if uploaded_file:
-    image = Image.open(uploaded_file).convert("RGB")
-    run_button = st.button("🚀 Run All Models")
     
-    if run_button:
-        col1, col2, col3 = st.columns(3)
+    for obj in objects:
+        box = obj['box']
+        label = f"{obj['label']} ({obj['confidence']})"
+        
+        draw.rectangle(box, outline=color, width=2)
+        
+        # Text background
+        text_bbox = draw.textbbox((box[0], box[1]-20), label, font=font)
+        draw.rectangle(text_bbox, fill=color)
+        draw.text((box[0], box[1]-20), label, fill='white', font=font)
+    
+    return img_copy
 
-        # Column 1: Input
+def main():
+    st.title("Image Analysis: Object Detection vs Image Captioning")
+    
+    # Load models
+    with st.spinner("Loading models... This may take a few minutes on first run."):
+        models = load_models()
+    
+    if models is None:
+        st.error("Failed to load models. Please refresh the page.")
+        return
+    
+    # File uploader and controls
+    uploaded_file = st.file_uploader("Upload Image", type=['png', 'jpg', 'jpeg'])
+    
+    if uploaded_file:
+        image = Image.open(uploaded_file).convert('RGB')
+        
+        # Controls section
+        st.subheader("Settings")
+        col_ctrl1, col_ctrl2, col_ctrl3 = st.columns(3)
+        
+        with col_ctrl1:
+            conf_threshold = st.slider("Confidence Threshold", 0.1, 1.0, 0.5, 0.1)
+        
+        with col_ctrl2:
+            st.write("")  # Spacing
+        
+        with col_ctrl3:
+            analyze_button = st.button("🚀 Analyze Image", type="primary", use_container_width=True)
+        
+        # Results section - Two columns
+        col1, col2 = st.columns(2)
+        
         with col1:
-            st.subheader("📥 Input Image")
+            st.header("Input Image")
             st.image(image, use_column_width=True)
-
-        # Column 2: Object Detection
+        
         with col2:
-            st.subheader("🟥 YOLOv8 Detection")
-            yolo_results = yolo_model(image)
-            yolo_img = yolo_results[0].plot()
-            yolo_pil = Image.fromarray(yolo_img[..., ::-1])
-            st.image(yolo_pil, use_column_width=True)
+            st.header("YOLOv11 Detection")
+            if analyze_button:
+                with st.spinner("Running YOLOv11..."):
+                    yolo_objects = detect_yolo_objects(image, models['yolo'], conf_threshold)
+                    yolo_img = draw_boxes(image, yolo_objects, 'red')
+                    st.image(yolo_img, use_column_width=True)
+                    
+                    st.subheader("Detected Objects:")
+                    for i, obj in enumerate(yolo_objects, 1):
+                        st.write(f"{i}. **{obj['label']}** ({obj['confidence']})")
+            else:
+                st.info("Click 'Analyze Image' to run detection")
+        
+        # BLIP Caption section (full width)
+        st.header("BLIP Image Caption")
+        if analyze_button:
+            with st.spinner("Generating caption..."):
+                caption = generate_blip_caption(image, models['blip'][0], models['blip'][1])
+                st.success(f"**{caption}**")
+        else:
+            st.info("Click 'Analyze Image' to generate caption")
 
-            st.subheader("🟦 DETR Detection")
-            detr_inputs = detr_processor(images=image, return_tensors="pt")
-            with torch.no_grad():
-                outputs = detr_model(**detr_inputs)
-            target_sizes = torch.tensor([image.size[::-1]])
-            results = detr_processor.post_process_object_detection(outputs, target_sizes=target_sizes, threshold=0.5)[0]
-
-            detr_boxes = {
-                'boxes': results["boxes"],
-                'scores': results["scores"],
-                'labels': [detr_model.config.id2label[int(i)] for i in results["labels"]]
-            }
-            detr_image = draw_boxes_detr(image.copy(), detr_boxes)
-            st.image(detr_image, use_column_width=True)
-
-        # Column 3: Captions
-        with col3:
-            st.subheader("📋 Captions & Summary")
-
-            base_caption = generate_caption(blip_base_proc, blip_base_model, image)
-            large_caption = generate_caption(blip_large_proc, blip_large_model, image)
-
-            yolo_labels = [yolo_model.names[int(cls)] for cls in yolo_results[0].boxes.cls] if yolo_results[0].boxes else []
-            yolo_summary = ", ".join(set(yolo_labels)) if yolo_labels else "No objects detected."
-
-            detr_summary = "\n".join([
-                f"{label} ({score:.2f})" 
-                for label, score in zip(detr_boxes['labels'], detr_boxes['scores'])
-            ]) or "No objects detected."
-
-            st.markdown(f"### 📝 BLIP Captions")
-            st.markdown(f"- **Base**: {base_caption}")
-            st.markdown(f"- **Large**: {large_caption}")
-
-            st.markdown("### 🟥 YOLOv8 Detected Objects")
-            st.markdown(f"- {yolo_summary}")
-
-            st.markdown("### 🟦 DETR Detected Objects")
-            st.markdown(detr_summary)
+if __name__ == "__main__":
+    main()
